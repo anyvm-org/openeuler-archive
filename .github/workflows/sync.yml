@@ -55,22 +55,55 @@ jobs:
         - { release: "22.03-LTS-SP4", arch: "aarch64" }
     name: ${{ matrix.release }} ${{ matrix.arch }}
     steps:
-    - name: Install aria2
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq aria2
-
     - name: Download from upstream
       run: |
         set -e
         rel="${{ matrix.release }}"
         arch="${{ matrix.arch }}"
         file="openEuler-$rel-$arch.qcow2.xz"
-        base="https://mirrors.aliyun.com/openeuler/openEuler-$rel/virtual_machine_img/$arch"
         echo "$file" > .assetname
-        # Segmented download: the origin honours Range, and a single stream
-        # only gets a fraction of the achievable rate.
-        aria2c -x8 -s8 -c --retry-wait=5 -m 10 --console-log-level=warn \
-          -o "$file" "$base/$file"
-        curl -fsSL --retry 5 -o "$file.sha256sum" "$base/$file.sha256sum"
+
+        # ONE stream, an honest User-Agent, resume on interruption.
+        #
+        # Deliberately NOT aria2 and NOT parallel Range requests:
+        #   * mirrors.aliyun.com answers 403 to aria2's default User-Agent
+        #     (and to an empty one); curl/wget/python UAs get 206.
+        #   * 8 concurrent Range requests to it mostly time out -- it
+        #     throttles concurrency. That is also why the builder's own
+        #     8-thread download of this very file swung between 3m50s and
+        #     22m11s across two runs.
+        # This job runs once per image set, so slow-but-reliable wins.
+        UA="anyvm-org/openeuler-archive (+https://github.com/anyvm-org/openeuler-archive)"
+        got=""
+        for base in \
+          "https://mirrors.aliyun.com/openeuler/openEuler-$rel/virtual_machine_img/$arch" \
+          "https://repo.openeuler.org/openEuler-$rel/virtual_machine_img/$arch" \
+          ; do
+          echo "::group::trying $base"
+          expected=$(curl -sSI -A "$UA" -m 60 "$base/$file" | tr -d '\r' \
+                     | awk 'tolower($1)=="content-length:"{print $2}' | tail -1)
+          echo "expected size: ${expected:-unknown}"
+          if [ -n "$expected" ]; then
+            # Resume until the local size matches. --speed-limit aborts a
+            # stalled transfer so the next attempt picks it up again,
+            # instead of hanging until the job timeout.
+            for attempt in 1 2 3 4 5 6; do
+              have=$(stat -c%s "$file" 2>/dev/null || echo 0)
+              if [ "$have" = "$expected" ]; then got="$base"; break; fi
+              echo "attempt $attempt: have $have of $expected bytes"
+              curl -fSL -A "$UA" -C - --speed-limit 10240 --speed-time 120 \
+                -o "$file" "$base/$file" || true
+            done
+          fi
+          echo "::endgroup::"
+          if [ -n "$got" ]; then break; fi
+        done
+        if [ -z "$got" ]; then
+          echo "could not download $file from any source"
+          exit 1
+        fi
+        echo "downloaded from $got"
+        curl -fsSL -A "$UA" --retry 5 -o "$file.sha256sum" "$got/$file.sha256sum"
         ls -lh "$file"
 
     - name: Verify checksum
