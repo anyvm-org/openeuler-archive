@@ -1,0 +1,92 @@
+name: Sync upstream images
+
+# Re-hosts the official openEuler VM images as release assets of this repo,
+# so the builders download them from GitHub (same cloud as the runners)
+# instead of from a rate-limited upstream. See README.md for the numbers.
+#
+# Run this once per image set: the published release images are immutable
+# (openEuler-25.09 stays openEuler-25.09), so a sync only has to be
+# repeated when a NEW release/arch is added to the matrix below.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish the images under"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Create the release if it does not exist
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        tag="${{ inputs.tag }}"
+        if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          echo "release $tag already exists, reusing it"
+        else
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+            --title "$tag" \
+            --notes "Re-hosted openEuler VM images (unmodified). See README.md."
+        fi
+
+  sync:
+    # Serialized behind create-release so the parallel uploads below never
+    # race to create the same release.
+    needs: create-release
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - { release: "25.09",         arch: "x86_64" }
+        - { release: "25.09",         arch: "aarch64" }
+        - { release: "25.09",         arch: "riscv64" }
+        - { release: "24.03-LTS-SP4", arch: "x86_64" }
+        - { release: "24.03-LTS-SP4", arch: "aarch64" }
+        - { release: "24.03-LTS-SP4", arch: "loongarch64" }
+        - { release: "22.03-LTS-SP4", arch: "x86_64" }
+        - { release: "22.03-LTS-SP4", arch: "aarch64" }
+    name: ${{ matrix.release }} ${{ matrix.arch }}
+    steps:
+    - name: Install aria2
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq aria2
+
+    - name: Download from upstream
+      run: |
+        set -e
+        rel="${{ matrix.release }}"
+        arch="${{ matrix.arch }}"
+        file="openEuler-$rel-$arch.qcow2.xz"
+        base="https://mirrors.aliyun.com/openeuler/openEuler-$rel/virtual_machine_img/$arch"
+        echo "$file" > .assetname
+        # Segmented download: the origin honours Range, and a single stream
+        # only gets a fraction of the achievable rate.
+        aria2c -x8 -s8 -c --retry-wait=5 -m 10 --console-log-level=warn \
+          -o "$file" "$base/$file"
+        curl -fsSL --retry 5 -o "$file.sha256sum" "$base/$file.sha256sum"
+        ls -lh "$file"
+
+    - name: Verify checksum
+      run: |
+        set -e
+        file="$(cat .assetname)"
+        # Upstream ships plain `sha256sum` format, so -c validates both the
+        # digest and that we fetched the file the checksum names. A silent
+        # truncation (the exact failure this repo exists to avoid) fails here.
+        sha256sum -c "$file.sha256sum"
+
+    - name: Upload as a release asset
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -e
+        file="$(cat .assetname)"
+        gh release upload "${{ inputs.tag }}" "$file" "$file.sha256sum" \
+          --clobber --repo "$GITHUB_REPOSITORY"
