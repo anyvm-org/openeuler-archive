@@ -45,6 +45,7 @@ matches upstream exactly or never gets published.
 
 | Release | Arches |
 |---------|--------|
+| 26.09 | `x86_64`, `aarch64` |
 | 25.09 | `x86_64`, `aarch64`, `riscv64` |
 | 24.03-LTS-SP4 | `x86_64`, `aarch64`, `loongarch64` |
 | 22.03-LTS-SP4 | `x86_64`, `aarch64` |
@@ -64,8 +65,9 @@ VM_VHD_LINK="https://github.com/anyvm-org/openeuler-archive/releases/download/<t
 ```
 
 Note that this only covers the IMAGE download. The guest's own `dnf` still
-talks to a mirror at build time; `openeuler-builder`'s
-`hooks/vm_postBuild.sh` points that at `mirrors.aliyun.com`.
+talks to upstream at build time; `openeuler-builder`'s
+`hooks/vm_postBuild.sh` keeps it on `repo.openeuler.org` (the file says
+why a faster mirror was tried and dropped).
 
 ## Adding or refreshing an image
 
@@ -76,9 +78,19 @@ release/arch is added.
 1. Add the `{ release, arch }` pair to the matrix in
    `.github/workflows/sync.yml`.
 2. Run the **Sync upstream images** workflow (`workflow_dispatch`) with the
-   release tag to publish under. It downloads from upstream, verifies the
-   `.sha256sum`, and uploads both files as release assets.
+   release tag to publish under (`v1.0.0`, see below). It downloads from
+   upstream, verifies the `.sha256sum`, and uploads both files as release
+   assets. Images already on the release are skipped, so only the new
+   pairs download anything.
 3. Point the builder conf's `VM_VHD_LINK` at the new asset.
+
+Keep publishing under `v1.0.0`. `openeuler-builder`'s upstream watcher
+derives a new release's confs from the previous release's by swapping the
+version inside the asset NAME; the tag in the URL is copied unchanged. A
+new release therefore makes that watcher fail its URL check (HTTP 404 on
+the asset here) until step 2 has run -- that failure is the reminder to
+sync. It also fails when upstream drops an arch the previous release had
+(26.09 has no riscv64); land those confs by hand.
 
 ## License / provenance
 

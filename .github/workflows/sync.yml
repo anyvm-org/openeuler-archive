@@ -6,7 +6,9 @@ name: Sync upstream images
 #
 # Run this once per image set: the published release images are immutable
 # (openEuler-25.09 stays openEuler-25.09), so a sync only has to be
-# repeated when a NEW release/arch is added to the matrix below.
+# repeated when a NEW release/arch is added to the matrix below. Re-running
+# is cheap: every image already on the release is skipped, so only the new
+# matrix entries download anything.
 
 on:
   workflow_dispatch:
@@ -45,6 +47,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+        # 26.09 publishes x86_64 + aarch64 VM images only: on 2026-10-01
+        # openEuler-26.09/virtual_machine_img/ lists exactly those two
+        # directories (25.09 also had riscv64/).
+        - { release: "26.09",         arch: "x86_64" }
+        - { release: "26.09",         arch: "aarch64" }
         - { release: "25.09",         arch: "x86_64" }
         - { release: "25.09",         arch: "aarch64" }
         - { release: "25.09",         arch: "riscv64" }
@@ -55,7 +62,30 @@ jobs:
         - { release: "22.03-LTS-SP4", arch: "aarch64" }
     name: ${{ matrix.release }} ${{ matrix.arch }}
     steps:
+    - name: Skip an image that is already published
+      id: have
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -e
+        file="openEuler-${{ matrix.release }}-${{ matrix.arch }}.qcow2.xz"
+        # The published images are immutable, so an asset already on the
+        # release is final. Re-fetching it would cost ~15 minutes per image
+        # from the rate-limited upstream, and the --clobber re-upload below
+        # would delete the live asset first, so a builder downloading it in
+        # that window gets a 404. Skipping makes a re-run add only what is
+        # missing. Both files must be fully uploaded to count: a run that
+        # died mid-upload leaves a non-"uploaded" asset, which is redone.
+        have=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/${{ inputs.tag }}" \
+               --jq '.assets[] | select(.state == "uploaded") | .name')
+        if printf '%s\n' "$have" | grep -qxF "$file" \
+           && printf '%s\n' "$have" | grep -qxF "$file.sha256sum"; then
+          echo "$file is already published under ${{ inputs.tag }}, skipping"
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Download from upstream
+      if: steps.have.outputs.skip != 'true'
       run: |
         set -e
         rel="${{ matrix.release }}"
@@ -80,8 +110,15 @@ jobs:
           "https://repo.openeuler.org/openEuler-$rel/virtual_machine_img/$arch" \
           ; do
           echo "::group::trying $base"
-          expected=$(curl -sSI -A "$UA" -m 60 "$base/$file" | tr -d '\r' \
-                     | awk 'tolower($1)=="content-length:"{print $2}' | tail -1)
+          # Size only from a 200. A mirror that has not caught up with a
+          # fresh release answers 404 with a Content-Length of its own error
+          # page (aliyun: 2318 bytes for 26.09 on release day), which was
+          # taken as the image size and burned six resume attempts before
+          # falling through. -L so a redirecting mirror reports the target.
+          expected=$(curl -sSIL -A "$UA" -m 60 "$base/$file" | tr -d '\r' \
+                     | awk 'toupper($1) ~ /^HTTP\// {code = $2; len = ""}
+                            tolower($1) == "content-length:" {len = $2}
+                            END {if (code == "200") print len}')
           echo "expected size: ${expected:-unknown}"
           if [ -n "$expected" ]; then
             # Resume until the local size matches. --speed-limit aborts a
@@ -107,6 +144,7 @@ jobs:
         ls -lh "$file"
 
     - name: Verify checksum
+      if: steps.have.outputs.skip != 'true'
       run: |
         set -e
         file="$(cat .assetname)"
@@ -116,6 +154,7 @@ jobs:
         sha256sum -c "$file.sha256sum"
 
     - name: Upload as a release asset
+      if: steps.have.outputs.skip != 'true'
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
